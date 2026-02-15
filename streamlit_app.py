@@ -7,7 +7,7 @@ import math
 
 st.set_page_config(page_title="Net Demand + BESS Optimizer (48h)", layout="wide")
 st.title("Net Demand (Load - RES) + BESS Optimization (48h)")
-st.caption("Features: Upload Load/RES, Net demand before/after, Peak shave + Valley fill, Charge only when RES>threshold, 4-hour block schedule (no switching within 4 hours).")
+st.caption("Auto-identifies valley (solar/high RES, low net demand) and peak (low RES, high net demand). Uses 4-hour block schedule (no switching inside block).")
 
 # -----------------------
 # Sidebar inputs
@@ -25,21 +25,26 @@ soc_max = st.sidebar.slider("SOC max (%)", 0, 100, 90) / 100.0
 eta_ch = st.sidebar.slider("Charge efficiency", 50, 100, 95) / 100.0
 eta_dis = st.sidebar.slider("Discharge efficiency", 50, 100, 95) / 100.0
 
-st.sidebar.header("Charging Rule")
-res_charge_threshold = st.sidebar.number_input("Charge only if RES > (MW)", value=400.0, min_value=0.0)
-
 st.sidebar.header("No Switching Constraint")
 block_hours = st.sidebar.number_input("Minimum constant duration (hours)", value=4.0, min_value=0.5, step=0.5)
+
+st.sidebar.header("Auto Valley / Peak Identification")
+# Gate by RES to represent "solar penetration" vs "non-solar"
+res_solar_gate = st.sidebar.number_input("Solar penetration gate (RES > MW)", value=400.0, min_value=0.0)
+
+# Percentile rules on net demand
+valley_percentile = st.sidebar.slider("Valley net-demand percentile (low)", 1, 50, 25)  # e.g. 25th percentile
+peak_percentile = st.sidebar.slider("Peak net-demand percentile (high)", 50, 99, 80)    # e.g. 80th percentile
 
 st.sidebar.header("Optimization Tuning")
 lam_smooth = st.sidebar.slider("Smoothness weight (lambda)", 0.0, 10.0, 0.2, 0.1)
 w_range = st.sidebar.slider("Peak-Valley weight", 0.0, 10.0, 1.0, 0.1)
 
 st.sidebar.markdown("---")
-st.sidebar.write("Sign convention:")
-st.sidebar.write("- Discharge reduces net demand")
-st.sidebar.write("- Charge increases net demand")
-st.sidebar.write("Block schedule: power is constant inside each block.")
+st.sidebar.write("Rule summary:")
+st.sidebar.write("- Valley blocks: RES high + net demand low -> CHARGE allowed")
+st.sidebar.write("- Peak blocks: RES low + net demand high -> DISCHARGE allowed")
+st.sidebar.write("- 4-hour blocks: constant power inside each block")
 
 # -----------------------
 # Upload data
@@ -80,98 +85,24 @@ if expected_points and N != int(expected_points):
 net_before = load_mw - res_mw
 
 # -----------------------
-# Build 4-hour blocks (or user-defined)
+# Identify valley & peak hours (per timestep)
+# -----------------------
+valley_thr = np.percentile(net_before, valley_percentile)
+peak_thr = np.percentile(net_before, peak_percentile)
+
+# “Solar penetration” indicator
+is_solar = res_mw > res_solar_gate
+is_non_solar = ~is_solar
+
+# Valley hours: solar penetration + net demand in low tail
+valley_mask = is_solar & (net_before <= valley_thr)
+
+# Peak hours: non-solar + net demand in high tail
+peak_mask = is_non_solar & (net_before >= peak_thr)
+
+# -----------------------
+# Build blocks (4-hour blocks)
 # -----------------------
 steps_per_block = max(1, int(round(block_hours / dt_hours)))
 B = int(math.ceil(N / steps_per_block))
-N_pad = B * steps_per_block
-pad_len = N_pad - N
-
-# Pad last values (repeat last) so blocks fit exactly
-if pad_len > 0:
-    load_pad = np.concatenate([load_mw, np.repeat(load_mw[-1], pad_len)])
-    res_pad = np.concatenate([res_mw, np.repeat(res_mw[-1], pad_len)])
-    net_before_pad = load_pad - res_pad
-    t_pad = np.concatenate([t_labels, np.array([f"pad{i+1}" for i in range(pad_len)])])
-else:
-    load_pad, res_pad, net_before_pad, t_pad = load_mw, res_mw, net_before, t_labels
-
-# For the RES charging rule, we restrict charging if ANY step in the block is <= threshold
-# (more strict, operationally safer)
-res_block_allow = np.ones(B, dtype=bool)
-for b in range(B):
-    s = b * steps_per_block
-    e = s + steps_per_block
-    res_block_allow[b] = np.all(res_pad[s:e] > res_charge_threshold)
-
-# -----------------------
-# Optimization variables (per block)
-# -----------------------
-p_ch_b = cp.Variable(B, nonneg=True)   # MW, constant within block
-p_dis_b = cp.Variable(B, nonneg=True)  # MW, constant within block
-soc = cp.Variable(N_pad + 1)
-
-# Expand block power to per-step arrays
-p_ch = cp.hstack([cp.hstack([p_ch_b[b]] * steps_per_block) for b in range(B)])
-p_dis = cp.hstack([cp.hstack([p_dis_b[b]] * steps_per_block) for b in range(B)])
-
-net_after = net_before_pad + p_ch - p_dis
-
-peak = cp.Variable()
-valley = cp.Variable()
-
-constraints = []
-
-# Power limits
-constraints += [p_ch_b <= Pmax_mw]
-constraints += [p_dis_b <= Pmax_mw]
-
-# SOC bounds + initial
-constraints += [soc[0] == soc0]
-constraints += [soc >= soc_min, soc <= soc_max]
-
-# SOC dynamics
-for k in range(N_pad):
-    constraints += [
-        soc[k+1] == soc[k] + (eta_ch * p_ch[k] - (1.0 / eta_dis) * p_dis[k]) * (dt_hours / E_mwh)
-    ]
-
-# Peak/valley envelope
-constraints += [net_after <= peak]
-constraints += [net_after >= valley]
-
-# Charging rule at BLOCK level
-for b in range(B):
-    if not res_block_allow[b]:
-        constraints += [p_ch_b[b] == 0]
-
-# Smoothness (still helps reduce oscillation at boundaries)
-smooth = cp.sum_squares(net_after[1:] - net_after[:-1])
-
-objective = cp.Minimize(w_range * (peak - valley) + lam_smooth * smooth)
-problem = cp.Problem(objective, constraints)
-
-with st.spinner("Running BESS optimization with 4-hour block constraint..."):
-    try:
-        problem.solve(solver=cp.OSQP, verbose=False)
-    except Exception:
-        problem.solve(solver=cp.ECOS, verbose=False)
-
-if problem.status not in ["optimal", "optimal_inaccurate"]:
-    st.error(f"Optimization failed. Status: {problem.status}")
-    st.stop()
-
-# Extract and unpad back to N
-p_ch_v = np.array(p_ch.value).flatten()[:N]
-p_dis_v = np.array(p_dis.value).flatten()[:N]
-soc_v = np.array(soc.value).flatten()[:N+1]
-net_after_v = np.array(net_after.value).flatten()[:N]
-
-p_bess = p_dis_v - p_ch_v  # +discharge, -charge
-
-# -----------------------
-# KPIs
-# -----------------------
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("Peak before (MW)", f"{np.max(net_before):.1f}")
-kpi2.metric("Peak after (MW)",
+N_pad = B * steps_per_b*_
