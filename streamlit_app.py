@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-
 import cvxpy as cp
 
 st.set_page_config(page_title="Net Demand + BESS Optimizer (48h)", layout="wide")
 st.title("Net Demand (Load - RES) + BESS Optimization (Valley Fill & Peak Shave)")
+st.caption("Rule added: Charging is allowed only when RES > threshold (default 400 MW).")
 
 # -----------------------
 # Sidebar inputs
@@ -23,6 +23,9 @@ soc_min = st.sidebar.slider("SOC min (%)", 0, 100, 10) / 100.0
 soc_max = st.sidebar.slider("SOC max (%)", 0, 100, 90) / 100.0
 eta_ch = st.sidebar.slider("Charge efficiency", 50, 100, 95) / 100.0
 eta_dis = st.sidebar.slider("Discharge efficiency", 50, 100, 95) / 100.0
+
+st.sidebar.header("Charging Rule")
+res_charge_threshold = st.sidebar.number_input("Charge only if RES > (MW)", value=400.0, min_value=0.0)
 
 st.sidebar.header("Optimization Tuning")
 lam_smooth = st.sidebar.slider("Smoothness weight (lambda)", 0.0, 10.0, 0.5, 0.1)
@@ -47,7 +50,12 @@ def read_profile(file, name):
     if "MW" not in df.columns:
         raise ValueError(f"{name} CSV must include a column named 'MW'")
     mw = df["MW"].astype(float).to_numpy()
-    t = df["time"].astype(str).to_numpy() if "time" in df.columns else np.array([f"t{i}" for i in range(len(mw))])
+
+    if "time" in df.columns:
+        t = df["time"].astype(str).to_numpy()
+    else:
+        t = np.array([f"t{i}" for i in range(len(mw))])
+
     return mw, t
 
 if (load_file is None) or (res_file is None):
@@ -73,18 +81,17 @@ if expected_points and N != int(expected_points):
 net_before = load_mw - res_mw
 
 # -----------------------
-# Optimization (convex): minimize (peak - valley) + lambda*smoothness
-# with SOC and power constraints.
+# Optimization (convex):
+# minimize (peak - valley) + lambda*smoothness
+# with SOC and power constraints
+# and rule: charge only if RES > threshold
 # -----------------------
-# Decision variables
 p_ch = cp.Variable(N, nonneg=True)   # MW charging (adds to demand)
 p_dis = cp.Variable(N, nonneg=True)  # MW discharging (reduces demand)
-soc = cp.Variable(N + 1)            # SOC in fraction [0..1]
+soc = cp.Variable(N + 1)             # SOC fraction [0..1]
 
-# Net demand after BESS
 net_after = net_before + p_ch - p_dis
 
-# Peak & valley variables (epigraph)
 peak = cp.Variable()
 valley = cp.Variable()
 
@@ -99,20 +106,26 @@ constraints += [soc[0] == soc0]
 constraints += [soc >= soc_min, soc <= soc_max]
 
 # SOC dynamics:
-# SOC[k+1] = SOC[k] + (eta_ch * p_ch[k] - (1/eta_dis) * p_dis[k]) * dt / E
+# SOC[k+1] = SOC[k] + (eta_ch*p_ch - (1/eta_dis)*p_dis) * dt / E
 for k in range(N):
     constraints += [
         soc[k+1] == soc[k] + (eta_ch * p_ch[k] - (1.0 / eta_dis) * p_dis[k]) * (dt_hours / E_mwh)
     ]
 
-# Peak-valley constraints
+# Peak-valley envelope
 constraints += [net_after <= peak]
 constraints += [net_after >= valley]
 
-# Smoothness term (reduce aggressive switching)
+# ---- Charging rule: charging only allowed when RES > threshold ----
+high_res_mask = (res_mw > res_charge_threshold)  # boolean array
+for k in range(N):
+    if not high_res_mask[k]:
+        constraints += [p_ch[k] == 0]
+
+# Smoothness term (avoid switching)
 smooth = cp.sum_squares(net_after[1:] - net_after[:-1])
 
-# Objective: reduce peak-valley range + smoothness
+# Objective: flatten net demand (range) + smoothness
 objective = cp.Minimize(w_range * (peak - valley) + lam_smooth * smooth)
 
 problem = cp.Problem(objective, constraints)
@@ -121,7 +134,6 @@ with st.spinner("Running BESS optimization..."):
     try:
         problem.solve(solver=cp.OSQP, verbose=False)
     except Exception:
-        # fallback solver
         problem.solve(solver=cp.ECOS, verbose=False)
 
 if problem.status not in ["optimal", "optimal_inaccurate"]:
@@ -133,11 +145,11 @@ p_dis_v = np.array(p_dis.value).flatten()
 soc_v = np.array(soc.value).flatten()
 net_after_v = np.array(net_after.value).flatten()
 
-# Convert to single signed power schedule (positive = discharge, negative = charge)
+# Signed BESS power (positive discharge, negative charge)
 p_bess = p_dis_v - p_ch_v
 
 # -----------------------
-# Results + Plots
+# KPIs
 # -----------------------
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 kpi1.metric("Peak before (MW)", f"{np.max(net_before):.1f}")
@@ -145,6 +157,16 @@ kpi2.metric("Peak after (MW)", f"{np.max(net_after_v):.1f}")
 kpi3.metric("Valley before (MW)", f"{np.min(net_before):.1f}")
 kpi4.metric("Valley after (MW)", f"{np.min(net_after_v):.1f}")
 
+# Quick check of rule
+viol = np.sum((res_mw <= res_charge_threshold) & (p_ch_v > 1e-6))
+if viol == 0:
+    st.success(f"Charging rule satisfied: p_ch=0 whenever RES ≤ {res_charge_threshold:.1f} MW.")
+else:
+    st.warning(f"Charging rule violations found: {viol} timesteps (should be 0).")
+
+# -----------------------
+# Charts
+# -----------------------
 st.subheader("Charts")
 
 c1, c2 = st.columns(2)
@@ -181,12 +203,18 @@ plt.title("State of Charge")
 plt.legend()
 st.pyplot(fig)
 
+# -----------------------
+# Data table + download
+# -----------------------
 st.subheader("Data Table (Download)")
+
 out = pd.DataFrame({
     "time": t_labels if len(t_labels) == N else [f"t{i}" for i in range(N)],
     "load_MW": load_mw,
     "res_MW": res_mw,
     "net_before_MW": net_before,
+    "bess_charge_MW": p_ch_v,
+    "bess_discharge_MW": p_dis_v,
     "bess_MW_(+dis,-ch)": p_bess,
     "net_after_MW": net_after_v,
     "soc_%": soc_v[:-1] * 100.0
