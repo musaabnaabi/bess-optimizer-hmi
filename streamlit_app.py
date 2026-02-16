@@ -4,29 +4,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cvxpy as cp
 
-st.set_page_config(page_title="Valley/Peak Window + BESS Smoothing Optimizer", layout="wide")
-st.title("Valley/Peak Window Identification + BESS Optimizer")
-st.caption("Finds ONE continuous valley window and ONE continuous peak window from Load & RES. Then smooths net demand as much as possible.")
+st.set_page_config(page_title="BESS Band-Constrained Net Demand Smoothing", layout="wide")
+st.title("BESS Optimizer: Keep Net Demand Within Thermal + Reserve Band")
+st.caption("NetAfter must satisfy:  Gmin + DownSR  ≤  NetAfter  ≤  Gmax - UpSR  , then smooth as much as possible.")
 
 # -----------------------
-# Sidebar
+# Sidebar inputs
 # -----------------------
-st.sidebar.header("Time step")
+st.sidebar.header("Time Step")
 dt_hours = st.sidebar.number_input("Time step (hours)", value=1.0, min_value=0.25, step=0.25)
 
-st.sidebar.header("Smoothing for detection")
-roll_n = st.sidebar.slider("Rolling window (points)", 1, 9, 3)
+st.sidebar.header("Thermal Limits + Reserves (MW)")
+use_time_varying_limits = st.sidebar.checkbox("Upload time-varying thermal limits/reserves (optional)", value=False)
 
-st.sidebar.header("Solar / Non-solar split")
-res_gate = st.sidebar.number_input("Solar penetration gate (RES > MW)", value=400.0, min_value=0.0)
+Gmax_const = st.sidebar.number_input("Gmax (Max thermal generation)", value=4800.0, min_value=0.0)
+Gmin_const = st.sidebar.number_input("Gmin (Min thermal generation)", value=1860.0, min_value=0.0)
+SR_up_const = st.sidebar.number_input("Upward spinning reserve SR_up", value=427.0, min_value=0.0)
+SR_dn_const = st.sidebar.number_input("Downward spinning reserve SR_down", value=170.0, min_value=0.0)
 
-st.sidebar.header("Window selection")
-# These pick candidate points BEFORE we choose the best contiguous window
-valley_pct = st.sidebar.slider("Valley net percentile (low)", 5, 50, 30)
-peak_pct = st.sidebar.slider("Peak net percentile (high)", 50, 95, 80)
-min_window_pts = st.sidebar.slider("Min window length (points)", 2, 24, 6)
-
-st.sidebar.header("BESS")
+st.sidebar.header("BESS Parameters")
 E_mwh = st.sidebar.number_input("Energy capacity E (MWh)", value=100.0, min_value=1.0)
 Pmax_mw = st.sidebar.number_input("Power limit Pmax (MW)", value=50.0, min_value=0.1)
 soc0 = st.sidebar.slider("Initial SOC (%)", 0, 100, 50) / 100.0
@@ -35,18 +31,28 @@ soc_max = st.sidebar.slider("SOC max (%)", 0, 100, 90) / 100.0
 eta_ch = st.sidebar.slider("Charge efficiency", 50, 100, 95) / 100.0
 eta_dis = st.sidebar.slider("Discharge efficiency", 50, 100, 95) / 100.0
 
-st.sidebar.header("Optimization (maximize smoothness)")
-w_flat = st.sidebar.slider("Flattening weight", 0.1, 50.0, 10.0, 0.1)
-w_smooth = st.sidebar.slider("Smoothness weight", 0.0, 50.0, 10.0, 0.1)
+st.sidebar.header("Smoothing Strength")
+w_flat = st.sidebar.slider("Flattening weight", 0.1, 100.0, 20.0, 0.1)
+w_smooth = st.sidebar.slider("Smoothness (ramping) weight", 0.0, 200.0, 40.0, 0.5)
+
+st.sidebar.header("Optional")
+enforce_end_soc = st.sidebar.checkbox("Force end SOC = start SOC", value=False)
 
 # -----------------------
-# Upload
+# Upload Load/RES
 # -----------------------
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     load_file = st.file_uploader("Upload Load CSV (column: MW)", type=["csv"])
-with col2:
+with c2:
     res_file = st.file_uploader("Upload RES CSV (column: MW)", type=["csv"])
+
+limits_file = None
+if use_time_varying_limits:
+    limits_file = st.file_uploader(
+        "Upload limits CSV (columns: Gmax, Gmin, SR_up, SR_down) optional time column",
+        type=["csv"]
+    )
 
 def read_profile(file, name):
     df = pd.read_csv(file)
@@ -57,7 +63,7 @@ def read_profile(file, name):
     return mw, t
 
 if load_file is None or res_file is None:
-    st.info("Upload both Load and RES files.")
+    st.info("Upload Load and RES CSVs to continue.")
     st.stop()
 
 load_mw, t = read_profile(load_file, "Load")
@@ -68,112 +74,46 @@ if len(load_mw) != len(res_mw):
     st.stop()
 
 N = len(load_mw)
-net = load_mw - res_mw
+net_before = load_mw - res_mw
 
 # -----------------------
-# Helper: rolling mean (for detection only)
+# Build thermal band arrays (constant or time-varying)
 # -----------------------
-def rolling_mean(x, n):
-    if n <= 1:
-        return x.copy()
-    s = pd.Series(x)
-    return s.rolling(n, center=True, min_periods=1).mean().to_numpy()
+if limits_file is None:
+    Gmax = np.full(N, Gmax_const, dtype=float)
+    Gmin = np.full(N, Gmin_const, dtype=float)
+    SR_up = np.full(N, SR_up_const, dtype=float)
+    SR_dn = np.full(N, SR_dn_const, dtype=float)
+else:
+    dfL = pd.read_csv(limits_file)
+    for col in ["Gmax", "Gmin", "SR_up", "SR_down"]:
+        if col not in dfL.columns:
+            st.error("Limits CSV must include columns: Gmax, Gmin, SR_up, SR_down")
+            st.stop()
+    if len(dfL) != N:
+        st.error(f"Limits CSV rows must match Load/RES rows. Limits={len(dfL)}, data={N}")
+        st.stop()
+    Gmax = dfL["Gmax"].astype(float).to_numpy()
+    Gmin = dfL["Gmin"].astype(float).to_numpy()
+    SR_up = dfL["SR_up"].astype(float).to_numpy()
+    SR_dn = dfL["SR_down"].astype(float).to_numpy()
 
-net_s = rolling_mean(net, roll_n)
-res_s = rolling_mean(res_mw, roll_n)
+upper_band = Gmax - SR_up
+lower_band = Gmin + SR_dn
 
-is_solar = res_s > res_gate
-is_nonsolar = ~is_solar
-
-# Candidate points
-valley_thr = np.percentile(net_s, valley_pct)
-peak_thr = np.percentile(net_s, peak_pct)
-
-valley_candidates = is_solar & (net_s <= valley_thr)
-peak_candidates = is_nonsolar & (net_s >= peak_thr)
-
-# -----------------------
-# Helper: find best contiguous window
-# We pick the "best" window by score:
-# - valley: lowest average net_s (and longest)
-# - peak: highest average net_s (and longest)
-# -----------------------
-def contiguous_windows(mask):
-    """Return list of (start, end_exclusive) for True runs."""
-    windows = []
-    i = 0
-    n = len(mask)
-    while i < n:
-        if mask[i]:
-            j = i
-            while j < n and mask[j]:
-                j += 1
-            windows.append((i, j))
-            i = j
-        else:
-            i += 1
-    return windows
-
-def best_valley_window(mask, series, min_len):
-    wins = [(s, e) for (s, e) in contiguous_windows(mask) if (e - s) >= min_len]
-    if not wins:
-        return None
-    # score: lower mean is better; tie-breaker longer
-    best = None
-    best_score = None
-    for s, e in wins:
-        mean_val = float(np.mean(series[s:e]))
-        score = (mean_val, -(e - s))  # minimize mean, maximize length
-        if best is None or score < best_score:
-            best = (s, e)
-            best_score = score
-    return best
-
-def best_peak_window(mask, series, min_len):
-    wins = [(s, e) for (s, e) in contiguous_windows(mask) if (e - s) >= min_len]
-    if not wins:
-        return None
-    # score: higher mean is better; tie-breaker longer
-    best = None
-    best_score = None
-    for s, e in wins:
-        mean_val = float(np.mean(series[s:e]))
-        score = (-mean_val, -(e - s))  # maximize mean => minimize negative mean
-        if best is None or score < best_score:
-            best = (s, e)
-            best_score = score
-    return best
-
-valley_win = best_valley_window(valley_candidates, net_s, min_window_pts)
-peak_win = best_peak_window(peak_candidates, net_s, min_window_pts)
-
-valley_mask = np.zeros(N, dtype=bool)
-peak_mask = np.zeros(N, dtype=bool)
-
-if valley_win is not None:
-    valley_mask[valley_win[0]:valley_win[1]] = True
-if peak_win is not None:
-    peak_mask[peak_win[0]:peak_win[1]] = True
-
-if valley_win is None:
-    st.warning("No VALLEY window found. Try increasing valley percentile or reducing min window length.")
-if peak_win is None:
-    st.warning("No PEAK window found. Try decreasing peak percentile or reducing min window length.")
+# Feasibility check
+if np.any(lower_band > upper_band):
+    st.error("Infeasible band: some hours have (Gmin+DownSR) > (Gmax-SR_up). Fix inputs.")
+    st.stop()
 
 # -----------------------
-# Optimization: flatten net_after as much as possible
-# net_after = net + charge - discharge
-# Objective:
-#   w_flat * sum((net_after - m)^2)  +  w_smooth * sum((Δnet_after)^2)
-# This makes net demand very smooth and flat.
+# Optimization
 # -----------------------
 p_ch = cp.Variable(N, nonneg=True)
 p_dis = cp.Variable(N, nonneg=True)
 soc = cp.Variable(N + 1)
 
-net_after = net + p_ch - p_dis
-
-m = cp.Variable()  # "flat target" level (chosen by optimizer)
+net_after = net_before + p_ch - p_dis
 
 constraints = []
 constraints += [p_ch <= Pmax_mw, p_dis <= Pmax_mw]
@@ -185,24 +125,22 @@ for k in range(N):
         soc[k+1] == soc[k] + (eta_ch * p_ch[k] - (1.0 / eta_dis) * p_dis[k]) * (dt_hours / E_mwh)
     ]
 
-# Charge only in valley window
-for k in range(N):
-    if not valley_mask[k]:
-        constraints += [p_ch[k] == 0]
-# Discharge only in peak window
-for k in range(N):
-    if not peak_mask[k]:
-        constraints += [p_dis[k] == 0]
+if enforce_end_soc:
+    constraints += [soc[N] == soc0]
 
-# Objective terms
+# HARD security band constraints
+constraints += [net_after <= upper_band]
+constraints += [net_after >= lower_band]
+
+# "Smooth as much as possible"
+m = cp.Variable()  # chosen flat level
 flat_term = cp.sum_squares(net_after - m)
 smooth_term = cp.sum_squares(net_after[1:] - net_after[:-1])
 
 objective = cp.Minimize(w_flat * flat_term + w_smooth * smooth_term)
-
 problem = cp.Problem(objective, constraints)
 
-with st.spinner("Optimizing (flatten + smooth)..."):
+with st.spinner("Optimizing..."):
     try:
         problem.solve(solver=cp.OSQP, verbose=False)
     except Exception:
@@ -222,45 +160,36 @@ p_bess = p_dis_v - p_ch_v
 # KPIs
 # -----------------------
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Peak before (MW)", f"{np.max(net):.1f}")
-k2.metric("Peak after (MW)", f"{np.max(net_after_v):.1f}")
-k3.metric("Valley before (MW)", f"{np.min(net):.1f}")
-k4.metric("Valley after (MW)", f"{np.min(net_after_v):.1f}")
+k1.metric("Net peak BEFORE (MW)", f"{np.max(net_before):.1f}")
+k2.metric("Net peak AFTER (MW)", f"{np.max(net_after_v):.1f}")
+k3.metric("Net min BEFORE (MW)", f"{np.min(net_before):.1f}")
+k4.metric("Net min AFTER (MW)", f"{np.min(net_after_v):.1f}")
 
-if valley_win is not None:
-    st.success(f"VALLEY window: {valley_win[0]} → {valley_win[1]-1}  (length {valley_win[1]-valley_win[0]} points)")
-if peak_win is not None:
-    st.success(f"PEAK window: {peak_win[0]} → {peak_win[1]-1}  (length {peak_win[1]-peak_win[0]} points)")
+st.info(f"Band enforced: lower = Gmin+DownSR, upper = Gmax-SR_up")
 
 # -----------------------
-# Plot
+# Plot: Net + Band
 # -----------------------
-st.subheader("Net Demand + Identified Valley/Peak Windows")
+st.subheader("Net Demand Before/After with Thermal+Reserve Band")
 
 fig = plt.figure()
-plt.plot(net, label="Net before (Load-RES)")
+plt.plot(net_before, label="Net before (Load-RES)")
 plt.plot(net_after_v, label="Net after (with BESS)")
-
-# Shade valley and peak windows (continuous)
-if valley_win is not None:
-    plt.axvspan(valley_win[0], valley_win[1]-1, alpha=0.2, label="Valley window")
-if peak_win is not None:
-    plt.axvspan(peak_win[0], peak_win[1]-1, alpha=0.2, label="Peak window")
-
+plt.plot(upper_band, label="Upper limit = Gmax - SR_up")
+plt.plot(lower_band, label="Lower limit = Gmin + SR_down")
 plt.xlabel("Time step")
 plt.ylabel("MW")
-plt.title("Net Demand (Before/After) + Windows")
+plt.title("Band-Constrained Net Smoothing")
 plt.legend()
 st.pyplot(fig)
 
-st.subheader("BESS Schedule")
+st.subheader("BESS Power (+discharge, -charge)")
 fig = plt.figure()
-plt.plot(p_bess, label="BESS MW (+discharge, -charge)")
+plt.plot(p_bess, label="BESS MW (+dis, -ch)")
 plt.axhline(Pmax_mw, linestyle="--")
 plt.axhline(-Pmax_mw, linestyle="--")
 plt.xlabel("Time step")
 plt.ylabel("MW")
-plt.title("BESS Power")
 plt.legend()
 st.pyplot(fig)
 
@@ -271,21 +200,20 @@ plt.axhline(soc_min * 100.0, linestyle="--")
 plt.axhline(soc_max * 100.0, linestyle="--")
 plt.xlabel("Time step")
 plt.ylabel("%")
-plt.title("State of Charge")
 plt.legend()
 st.pyplot(fig)
 
 # -----------------------
-# Table
+# Table + download
 # -----------------------
 st.subheader("Results Table")
 out = pd.DataFrame({
     "time": t,
     "load_MW": load_mw,
     "res_MW": res_mw,
-    "net_before_MW": net,
-    "valley_window": valley_mask.astype(int),
-    "peak_window": peak_mask.astype(int),
+    "net_before_MW": net_before,
+    "upper_limit_Gmax_minus_SRup": upper_band,
+    "lower_limit_Gmin_plus_SRdn": lower_band,
     "bess_charge_MW": p_ch_v,
     "bess_discharge_MW": p_dis_v,
     "bess_MW_(+dis,-ch)": p_bess,
@@ -297,6 +225,6 @@ st.dataframe(out, use_container_width=True)
 st.download_button(
     "Download results CSV",
     data=out.to_csv(index=False).encode("utf-8"),
-    file_name="bess_valley_peak_windows_results.csv",
+    file_name="bess_band_smoothing_results.csv",
     mime="text/csv",
 )
